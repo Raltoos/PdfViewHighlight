@@ -11,7 +11,7 @@ const COLORS = [
   "#f48fb1", "#f8bbd0", "#ce93d8", "#b39ddb", "#90caf9",
   "#80cbc4", "#a5d6a7", "#c5e1a5", "#b2dfdb", "#cfd8dc",
 ];
-const DEFAULT_OPACITY = 0.22; // tuned so text always stays very readable // looks like a real highlighter
+const DEFAULT_OPACITY = 0.22; // tuned so text always stays very readable
 const DEFAULT_THICKNESS = 18;
 
 // Helper: rgba css from hex + alpha
@@ -26,17 +26,17 @@ export default function PDFHighlighterApp() {
   const containerRef = useRef(null);         // wraps all pages
   const fileInputRef = useRef(null);
   const overlaysRef = useRef({});            // pageIndex -> overlay <canvas>
-  const renderTokenRef = useRef("");        // cancel stale renders
+  const renderTokenRef = useRef("");         // cancel stale renders
 
   // Core state
   const [pdfBytes, setPdfBytes] = useState(null); // pristine bytes for pdf-lib
   const [pdfDoc, setPdfDoc] = useState(null);
-  const [baseScale] = useState(1.25);        // fixed render scale for pdf.js
-  const [zoom, setZoom] = useState(1);       // visual zoom via CSS transform
+  const [baseScale] = useState(1.25);        // base render scale for pdf.js
+  const [zoom, setZoom] = useState(1);       // true zoom (pages re-render at this)
 
   // Tool state
   const [color, setColor] = useState(COLORS[0]);
-  const [opacity, setOpacity] = useState(DEFAULT_OPACITY); // UI value; we still clamp internally
+  const [opacity, setOpacity] = useState(DEFAULT_OPACITY);
   const [thickness, setThickness] = useState(DEFAULT_THICKNESS);
   const [eraser, setEraser] = useState(false);
 
@@ -45,18 +45,15 @@ export default function PDFHighlighterApp() {
   const opacityRef = useRef(opacity);
   const thickRef = useRef(thickness);
   const eraserRef = useRef(eraser);
-  useEffect(()=>{ colorRef.current = color; },[color]);
-  useEffect(()=>{ opacityRef.current = opacity; },[opacity]);
-  useEffect(()=>{ thickRef.current = thickness; },[thickness]);
-  useEffect(()=>{ eraserRef.current = eraser; updateOverlayCursors(); },[eraser]);
 
-  // Keep CSS zoom in sync
-  useEffect(()=>{
-    if (containerRef.current) {
-      containerRef.current.style.transformOrigin = 'top left';
-      containerRef.current.style.transform = `scale(${zoom})`;
-    }
-  },[zoom]);
+  // ✨ Keep refs in sync with state (this was missing, causing your issue)
+  useEffect(() => { colorRef.current = color; }, [color]);
+  useEffect(() => { opacityRef.current = opacity; }, [opacity]);
+  useEffect(() => { thickRef.current = thickness; }, [thickness]);
+  useEffect(() => { 
+    eraserRef.current = eraser; 
+    updateOverlayCursors(); 
+  }, [eraser]);
 
   // ===== File open =====
   const onOpen = async (e) => {
@@ -65,21 +62,27 @@ export default function PDFHighlighterApp() {
     const ab = await file.arrayBuffer();
     const bytes = new Uint8Array(ab);
     const libBytes = bytes.slice();      // keep pristine for pdf-lib
-    const viewerBytes = bytes.slice();   // give this to pdf.js
+    const viewerBytes = bytes.slice();   // give this to pdf.js (worker may transfer/detach)
     setPdfBytes(libBytes);
 
     const loading = pdfjsLib.getDocument({ data: viewerBytes });
     const doc = await loading.promise;
     setPdfDoc(doc);
-    setTimeout(() => renderAll(doc, baseScale), 0);
+    setTimeout(() => renderAll(doc, baseScale * zoom), 0);
   };
 
-  useEffect(()=>{ if (pdfDoc) renderAll(pdfDoc, baseScale); }, [pdfDoc, baseScale]);
+  // Re-render pages at true zoom (crisp quality)
+  useEffect(()=>{ 
+    if (pdfDoc) renderAll(pdfDoc, baseScale * zoom); 
+  }, [pdfDoc, baseScale, zoom]);
 
   // ===== Render all pages (bitmap + overlay brush) =====
   const renderAll = (doc, scaleVal) => {
     const container = containerRef.current;
     if (!container) return;
+
+    // Keep previous overlays so we can scale strokes into the new size
+    const prevOverlays = overlaysRef.current;
 
     const token = Math.random().toString(36).slice(2);
     renderTokenRef.current = token;
@@ -104,26 +107,29 @@ export default function PDFHighlighterApp() {
         const page = await doc.getPage(i);
         const viewport = page.getViewport({ scale: scaleVal });
 
-        // PDF bitmap canvas
+        // PDF bitmap canvas (HiDPI)
         const pdfCanvas = document.createElement('canvas');
         const pdfCtx = pdfCanvas.getContext('2d');
-        pdfCanvas.width = Math.ceil(viewport.width);
-        pdfCanvas.height = Math.ceil(viewport.height);
+        const dpr = window.devicePixelRatio || 1;
+        pdfCanvas.width = Math.ceil(viewport.width * dpr);
+        pdfCanvas.height = Math.ceil(viewport.height * dpr);
         pdfCanvas.style.width = `${viewport.width}px`;
         pdfCanvas.style.height = `${viewport.height}px`;
+        pdfCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
         await page.render({ canvasContext: pdfCtx, viewport }).promise;
 
-        // Overlay brush canvas
+        // Overlay brush canvas (HiDPI to match PDF)
         const olCanvas = document.createElement('canvas');
-        const olCtx = olCanvas.getContext('2d');
-        olCanvas.width = pdfCanvas.width;
-        olCanvas.height = pdfCanvas.height;
+        const dpr2 = window.devicePixelRatio || 1;
+        olCanvas.width = Math.ceil(viewport.width * dpr2);
+        olCanvas.height = Math.ceil(viewport.height * dpr2);
         olCanvas.style.position = 'absolute';
         olCanvas.style.inset = '0';
         olCanvas.style.width = `${viewport.width}px`;
         olCanvas.style.height = `${viewport.height}px`;
-        // Key: blend like a real highlighter so text always shows through
         olCanvas.style.mixBlendMode = 'multiply';
+        olCanvas.style.touchAction = 'none';        // prevent touch scrolling while drawing
+        const olCtx = olCanvas.getContext('2d');
 
         const wrap = wrappers[i-1];
         wrap.innerHTML = '';
@@ -132,44 +138,64 @@ export default function PDFHighlighterApp() {
         wrap.appendChild(pdfCanvas);
         wrap.appendChild(olCanvas);
 
+        // Preserve existing strokes by scaling previous overlay into the new size
+        const prev = prevOverlays[i-1];
+        if (prev && prev.width && prev.height) {
+          try { 
+            olCtx.drawImage(prev, 0, 0, prev.width, prev.height, 0, 0, olCanvas.width, olCanvas.height); 
+          } catch(_) {}
+        }
+
         overlaysRef.current[i-1] = olCanvas;
         attachBrushHandlers(olCanvas);
+        // ensure cursor reflects current tool state
+        olCanvas.style.cursor = eraserRef.current ? 'not-allowed' : 'crosshair';
       }
     })();
   };
 
   const updateOverlayCursors = () => {
     Object.values(overlaysRef.current).forEach((c)=>{
-      if (c) c.style.cursor = eraserRef.current ? 'not-allowed' : 'crosshair';
+      if (!c) return;
+      c.style.cursor = eraserRef.current ? 'not-allowed' : 'crosshair';
     });
   };
 
-  // ===== Brush & Eraser =====
+  // ===== Brush & Eraser (uniform thickness, live tool state) =====
   const attachBrushHandlers = (canvas) => {
+    // prevent context-menu from interrupting pointer capture
+    canvas.oncontextmenu = (e) => e.preventDefault();
+
     const ctx = canvas.getContext('2d');
     let drawing = false;
     let last = null;
 
     const getLocal = (evt) => {
       const r = canvas.getBoundingClientRect();
-      // account for CSS scaling
+      // account for CSS size vs canvas pixel size
       const scaleX = canvas.width / r.width;
       const scaleY = canvas.height / r.height;
-      return { x: (evt.clientX - r.left) * scaleX, y: (evt.clientY - r.top) * scaleY };
+      return { 
+        x: (evt.clientX - r.left) * scaleX, 
+        y: (evt.clientY - r.top) * scaleY,
+        scaleX
+      };
     };
 
     const strokeTo = (from, to) => {
       ctx.lineCap = 'round';
       ctx.lineJoin = 'round';
-      ctx.lineWidth = Math.max(4, thickRef.current); // keep a minimum for smoothness
-      const alpha = Math.min(opacityRef.current ?? DEFAULT_OPACITY, 0.25); // hard cap to keep text readable
-      if (eraserRef.current) {
-        ctx.globalCompositeOperation = 'destination-out';
-        ctx.strokeStyle = 'rgba(0,0,0,1)';
-      } else {
-        ctx.globalCompositeOperation = 'source-over';
-        ctx.strokeStyle = rgbaCss(colorRef.current, alpha);
-      }
+
+      // Keep visual thickness constant in CSS px
+      const pixelRatio = to.scaleX || (window.devicePixelRatio || 1);
+      ctx.lineWidth = Math.max(2, thickRef.current * pixelRatio);
+
+      // **Read latest tool state on every segment** so color/eraser changes apply instantly
+      const isErasing = !!eraserRef.current;
+      const alpha = Math.min(opacityRef.current ?? DEFAULT_OPACITY, 0.25); // cap for readability
+      ctx.globalCompositeOperation = isErasing ? 'destination-out' : 'source-over';
+      ctx.strokeStyle = isErasing ? 'rgba(0,0,0,1)' : rgbaCss(colorRef.current, alpha);
+
       ctx.beginPath();
       ctx.moveTo(from.x, from.y);
       ctx.lineTo(to.x, to.y);
@@ -192,57 +218,41 @@ export default function PDFHighlighterApp() {
     canvas.onpointerleave = stop;
   };
 
-  // ===== Save back to PDF (overlay as transparent PNG per page) =====
+  // ===== Save back to PDF (preview-perfect composite) =====
   const onSave = async () => {
-    if (!pdfBytes) return;
+    if (!pdfBytes || !pdfDoc) return;
     const pdf = await PDFDocument.load(pdfBytes);
 
-    // Goal: make the exported PDF look exactly like the on-screen preview (multiply blend).
-    // Approach: re-render each page with pdf.js to a bitmap, then multiply-composite the
-    // brush overlay on top in a temporary canvas, and embed that flattened image.
-    // This trades selectable text for perfect visual parity with the preview.
+    // Re-render each page with pdf.js at current overlay size, multiply the overlay,
+    // and embed the flattened bitmap -> exported PDF matches the preview.
+    for (let i = 0; i < pdf.getPageCount(); i++) {
+      const page = pdf.getPage(i);
+      const jsPage = await pdfDoc.getPage(i + 1);
 
-    if (!pdfDoc) {
-      // Fallback to previous behavior if pdfDoc is unavailable
-      for (let i = 0; i < pdf.getPageCount(); i++) {
-        const page = pdf.getPage(i);
-        const { width, height } = page.getSize();
-        const ol = overlaysRef.current[i];
-        if (!ol) continue;
-        const dataUrl = ol.toDataURL('image/png');
-        const png = await pdf.embedPng(dataUrl);
-        page.drawImage(png, { x: 0, y: 0, width, height, opacity: 1 });
-      }
-    } else {
-      for (let i = 0; i < pdf.getPageCount(); i++) {
-        const page = pdf.getPage(i);
-        const jsPage = await pdfDoc.getPage(i + 1);
+      // Render page bitmap at a scale matching the current overlay size
+      const baseViewport = jsPage.getViewport({ scale: 1 });
+      const ol = overlaysRef.current[i];
+      if (!ol) continue;
 
-        // Determine a viewport scale that matches our overlay canvas size
-        const baseViewport = jsPage.getViewport({ scale: 1 });
-        const ol = overlaysRef.current[i];
-        if (!ol) continue;
-        const scale = ol.width / Math.ceil(baseViewport.width || 1);
-        const viewport = jsPage.getViewport({ scale: Math.max(0.1, scale) });
+      const scale = ol.width / Math.max(1, Math.ceil(baseViewport.width));
+      const viewport = jsPage.getViewport({ scale: Math.max(0.1, scale) });
 
-        // Render the PDF page bitmap at the chosen scale
-        const tmp = document.createElement('canvas');
-        tmp.width = Math.ceil(viewport.width);
-        tmp.height = Math.ceil(viewport.height);
-        const tctx = tmp.getContext('2d');
-        await jsPage.render({ canvasContext: tctx, viewport }).promise;
+      const tmp = document.createElement("canvas");
+      tmp.width = Math.ceil(viewport.width);
+      tmp.height = Math.ceil(viewport.height);
+      const tctx = tmp.getContext("2d");
+      await jsPage.render({ canvasContext: tctx, viewport }).promise;
 
-        // Multiply-composite the overlay exactly like the preview
-        tctx.globalCompositeOperation = 'multiply';
-        // If overlay size differs by a pixel, stretch to fit to avoid seams
-        tctx.drawImage(ol, 0, 0, tmp.width, tmp.height);
+      // Multiply-composite overlay exactly like the preview
+      tctx.globalCompositeOperation = "multiply";
+      // If overlay size differs by a pixel, stretch to fit to avoid seams
+      tctx.drawImage(ol, 0, 0, tmp.width, tmp.height);
 
-        // Embed the flattened bitmap
-        const dataUrl = tmp.toDataURL('image/png');
-        const png = await pdf.embedPng(dataUrl);
-        const { width, height } = page.getSize();
-        page.drawImage(png, { x: 0, y: 0, width, height, opacity: 1 });
-      }
+      // Embed the flattened bitmap
+      const dataUrl = tmp.toDataURL("image/png");
+      const png = await pdf.embedPng(dataUrl);
+      const { width, height } = page.getSize();
+      page.drawImage(png, { x: 0, y: 0, width, height, opacity: 1 });
     }
 
     const out = await pdf.save();
@@ -263,7 +273,7 @@ export default function PDFHighlighterApp() {
           <div className="flex items-center gap-2">
             <button onClick={() => setZoom((z)=>Math.max(0.5, +(z-0.1).toFixed(2)))} className="px-2 py-1 rounded border bg-white">-</button>
             <div className="px-2 text-sm tabular-nums">{zoom.toFixed(2)}x</div>
-            <button onClick={() => setZoom((z)=>Math.min(3, +(z+0.1).toFixed(2)))} className="px-2 py-1 rounded border bg-white">+</button>
+            <button onClick={() => setZoom((z)=>Math.min(4, +(z+0.1).toFixed(2)))} className="px-2 py-1 rounded border bg-white">+</button>
           </div>
 
           <div className="flex items-center gap-2">
@@ -292,9 +302,11 @@ export default function PDFHighlighterApp() {
         </div>
       </header>
 
-      <main className="max-w-6xl mx-auto p-3">
+      <main className="max-w-6xl mx-auto p-3" style={{ overflowX: 'auto' }}>
         {!pdfDoc && <div className="text-center py-16 text-slate-500">Open a PDF to start highlighting.</div>}
-        <div ref={containerRef} className="flex flex-col items-start" style={{ transformOrigin: 'top left', transform: `scale(${zoom})` }} />
+        <div style={{ minWidth: 'fit-content' }}>
+          <div ref={containerRef} className="flex flex-col items-start" style={{ display: 'inline-block' }} />
+        </div>
       </main>
     </div>
   );
